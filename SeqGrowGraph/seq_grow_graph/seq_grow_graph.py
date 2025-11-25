@@ -1,5 +1,6 @@
 import os
 import copy
+import math
 import cv2
 import torch
 import torch.nn as nn
@@ -16,7 +17,7 @@ from .core import seq2nodelist, seq2bznodelist, seq2plbznodelist, av2seq2bznodel
 from .core import EvalSeq2Graph_with_start as EvalSeq2Graph
 
 from .encode_centerline import convert_coeff_coord
-from .bz_roadnet_reach_dist_eval import get_geom, get_range
+from .bz_roadnet_reach_dist_eval import get_geom, get_range, eval_landmark, eval_reach, eval_fscore
 from .lane_diffusion import LaneDiffusion
 from .flow_matching import FlowMatchingBEV
 
@@ -58,6 +59,8 @@ class SeqGrowGraph(MVXTwoStageDetector):
                  flow_matching_stage='inference',
                  use_grpo_loss=False,
                  grpo_cfg=None,
+                 landmark_thresholds=None,
+                 reach_thresholds=None,
                  ):
         super(SeqGrowGraph, self).__init__(pts_voxel_layer, pts_middle_encoder,
                                                         pts_fusion_layer, img_backbone, pts_backbone,
@@ -105,6 +108,15 @@ class SeqGrowGraph(MVXTwoStageDetector):
         self.noise_label = 569
         # self.noise_coeff = 570
         self.reward_eps = 1e-6
+        self._reward_stats = dict(count=0, mean=0.0, M2=0.0)
+        default_landmarks = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        default_reach = [1, 2, 3, 4, 5]
+        self.landmark_thresholds = (
+            list(landmark_thresholds) if landmark_thresholds is not None else default_landmarks
+        )
+        self.reach_thresholds = (
+            list(reach_thresholds) if reach_thresholds is not None else default_reach
+        )
         
         
         self.vis_cfg = vis_cfg
@@ -416,6 +428,69 @@ class SeqGrowGraph(MVXTwoStageDetector):
         
         return gt_centerlines
 
+    def _build_eval_graph(self, seq, token, is_gt=False):
+        if seq is None:
+            return None
+        if isinstance(seq, torch.Tensor):
+            seq = seq.detach().cpu().numpy()
+        if isinstance(seq, np.ndarray):
+            seq = seq.tolist()
+        seq = list(seq)
+        if len(seq) < 4:
+            return None
+        try:
+            return EvalSeq2Graph(
+                token,
+                seq,
+                self.pc_range,
+                self.dx,
+                self.bz_pc_range,
+                self.bz_dx,
+                front_camera_only=self.front_camera_only,
+                is_gt_fix=is_gt,
+            )
+        except Exception:
+            return None
+
+    def _compute_landmark_reach_reward(self, pred_seq, gt_seq, img_meta, reward_cfg):
+        min_reward = reward_cfg.get('min_reward', 0.0)
+        max_reward = reward_cfg.get('max_reward', 1.0)
+        beta = reward_cfg.get('beta', 1.0)
+        max_nodes = reward_cfg.get('reach_max_nodes', 5)
+        pred_graph = self._build_eval_graph(
+            pred_seq, img_meta.get('token', 'pred'), is_gt=False)
+        gt_graph = self._build_eval_graph(
+            gt_seq, img_meta.get('token', 'gt'),
+            is_gt=reward_cfg.get('fix_gt_graph', True))
+        if pred_graph is None or gt_graph is None:
+            return min_reward
+
+        try:
+            tp_l, fp_l, fn_l = eval_landmark(
+                gt_graph, pred_graph, self.landmark_thresholds)
+            lp, lr, lf = eval_fscore(tp_l, fn_l, fp_l, beta)
+            tp_r, fp_r, fn_r = eval_reach(
+                gt_graph, pred_graph, self.reach_thresholds, max_node_num=max_nodes)
+            rp, rr, rf = eval_fscore(tp_r, fn_r, fp_r, beta)
+            landmark_f = float(lf.mean()) if hasattr(lf, 'mean') else float(lf)
+            reach_f = float(rf.mean()) if hasattr(rf, 'mean') else float(rf)
+            if math.isnan(landmark_f):
+                landmark_f = 0.0
+            if math.isnan(reach_f):
+                reach_f = 0.0
+        except Exception:
+            return min_reward
+
+        landmark_weight = reward_cfg.get('landmark_weight', 0.5)
+        reach_weight = reward_cfg.get('reach_weight', 0.5)
+        weight_sum = max(landmark_weight + reach_weight, 1e-6)
+        reward = (
+            landmark_weight * landmark_f +
+            reach_weight * reach_f
+        ) / weight_sum
+        reward = max(min_reward, min(max_reward, reward))
+        return reward
+
     def _repeat_img_metas(self, img_metas, repeats):
         repeated = []
         for meta in img_metas:
@@ -423,8 +498,25 @@ class SeqGrowGraph(MVXTwoStageDetector):
                 repeated.append(copy.deepcopy(meta))
         return repeated
 
-    def _compute_sequence_reward(self, pred_seq, gt_seq, reward_cfg=None):
+    def _normalize_reward_value(self, value: float) -> float:
+        stats = self._reward_stats
+        if stats['count'] < 2:
+            normalized = value - stats['mean']
+        else:
+            var = stats['M2'] / max(stats['count'] - 1, 1)
+            std = math.sqrt(max(var, 1e-6))
+            normalized = (value - stats['mean']) / std
+        stats['count'] += 1
+        delta = value - stats['mean']
+        stats['mean'] += delta / stats['count']
+        stats['M2'] += delta * (value - stats['mean'])
+        return normalized
+
+    def _compute_sequence_reward(self, pred_seq, gt_seq, img_meta=None, reward_cfg=None):
         reward_cfg = reward_cfg or {}
+        reward_type = reward_cfg.get('type', 'token_f1')
+        if reward_type == 'landmark_reach' and img_meta is not None:
+            return self._compute_landmark_reach_reward(pred_seq, gt_seq, img_meta, reward_cfg)
         eps = reward_cfg.get('eps', self.reward_eps)
         ignore_tokens = {
             self.no_known,
@@ -488,24 +580,52 @@ class SeqGrowGraph(MVXTwoStageDetector):
         rewards = []
         for meta, pred in zip(repeated_metas, line_results):
             gt_seq = meta.get('centerline_sequence', [])
-            reward = self._compute_sequence_reward(pred['line_seqs'], gt_seq, reward_kwargs)
+            reward = self._compute_sequence_reward(
+                pred['line_seqs'], gt_seq, meta, reward_kwargs)
             rewards.append(reward)
 
-        reward_tensor = base_bev.new_tensor(rewards).view(b, group_size)
+        reward_tensor_raw = base_bev.new_tensor(rewards).view(b, group_size)
+
+        use_reward_norm = grpo_cfg.get('use_reward_normalizer', False)
+        if use_reward_norm:
+            norm_vals = [
+                self._normalize_reward_value(float(val))
+                for val in reward_tensor_raw.view(-1)
+            ]
+            reward_tensor = reward_tensor_raw.new_tensor(norm_vals).view_as(
+                reward_tensor_raw)
+        else:
+            reward_tensor = reward_tensor_raw
+
         baseline = reward_tensor.mean(dim=1, keepdim=True)
-        best_idx = reward_tensor.argmax(dim=1)
+        baseline_raw = reward_tensor_raw.mean(dim=1, keepdim=True)
+        best_idx = reward_tensor_raw.argmax(dim=1)
         best_rewards = reward_tensor.gather(1, best_idx.unsqueeze(1)).squeeze(1)
+        best_rewards_raw = reward_tensor_raw.gather(
+            1, best_idx.unsqueeze(1)).squeeze(1)
         advantages = best_rewards - baseline.squeeze(1)
         if normalize_adv:
             denom = advantages.std(unbiased=False) + self.reward_eps
             advantages = advantages / denom
 
-        best_indices = (torch.arange(b, device=base_bev.device) * group_size + best_idx).long()
+        best_indices = (torch.arange(
+            b, device=base_bev.device) * group_size + best_idx).long()
         target_feats = sampled_bev.detach()[best_indices]
 
-        deterministic_bev = self.flow_matching.sample(base_bev, num_steps=num_steps, noise_std=0.0)
-        per_sample_loss = F.mse_loss(deterministic_bev, target_feats, reduction='none').mean(dim=[1, 2, 3])
-        weight = 1.0 + adv_weight * advantages
+        deterministic_bev = self.flow_matching.sample(
+            base_bev, num_steps=num_steps, noise_std=0.0)
+        per_sample_loss = F.mse_loss(
+            deterministic_bev, target_feats, reduction='none').mean(dim=[1, 2, 3])
+
+        ratio_clip = grpo_cfg.get('ratio_clip', None)
+        if ratio_clip is not None:
+            denom = baseline_raw.squeeze(1).abs().clamp_min(1e-6)
+            ratio = (best_rewards_raw / denom).clamp(
+                1 - ratio_clip, 1 + ratio_clip)
+        else:
+            ratio = torch.ones_like(best_rewards_raw)
+
+        weight = ratio * (1.0 + adv_weight * advantages)
         grpo_loss = (per_sample_loss * weight).mean()
 
         if kl_weight > 0:
@@ -521,6 +641,7 @@ class SeqGrowGraph(MVXTwoStageDetector):
             'loss_grpo_kl': kl_term.detach(),
             'grpo_reward_mean': reward_tensor.mean(),
             'grpo_reward_max': best_rewards.mean(),
+            'grpo_ratio_mean': ratio.mean().detach(),
         }
     
     def predict(self, batch_inputs_dict, batch_data_samples, **kwargs):

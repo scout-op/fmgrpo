@@ -1,8 +1,25 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from ..lane_diffusion.lpim import LPIM
+
+
+def pos2posemb2d(pos: torch.Tensor, num_pos_feats: int = 64, temperature: int = 10000):
+    """2D sinusoidal positional embedding for flattened coordinates."""
+    if pos.dim() == 2:
+        pos = pos.unsqueeze(0)
+    scale = 2 * math.pi
+    pos = pos * scale
+    dim_t = torch.arange(num_pos_feats, dtype=pos.dtype, device=pos.device)
+    dim_t = temperature ** (2 * torch.div(dim_t, 2, rounding_mode="floor") / num_pos_feats)
+    pos_x = pos[..., 0, None] / dim_t
+    pos_y = pos[..., 1, None] / dim_t
+    pos_x = torch.stack((pos_x[..., 0::2].sin(), pos_x[..., 1::2].cos()), dim=-1).flatten(-2)
+    pos_y = torch.stack((pos_y[..., 0::2].sin(), pos_y[..., 1::2].cos()), dim=-1).flatten(-2)
+    posemb = torch.cat((pos_y, pos_x), dim=-1)
+    return posemb.squeeze(0)
 
 
 class TimeEmbedding(nn.Module):
@@ -64,6 +81,76 @@ class FlowMatchingVectorField(nn.Module):
         return self.net(inp)
 
 
+class AttentionVectorField(nn.Module):
+    """Transformer-style vector field conditioned on BEV positions."""
+
+    def __init__(
+        self,
+        bev_channels: int,
+        hidden_dim: int = 256,
+        num_layers: int = 4,
+        num_heads: int = 8,
+        time_embed_dim: int = 256,
+    ):
+        super().__init__()
+        assert hidden_dim % 2 == 0, "hidden_dim must be divisible by 2."
+        self.hidden_dim = hidden_dim
+        self.input_proj = nn.Conv2d(bev_channels, hidden_dim, kernel_size=1)
+        self.output_proj = nn.Conv2d(hidden_dim, bev_channels, kernel_size=1)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=0.1,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.time_embed = TimeEmbedding(time_embed_dim)
+        self.time_proj = nn.Linear(time_embed_dim, hidden_dim)
+        self.type_embedding = nn.Embedding(2, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.register_buffer("_cached_pos", None, persistent=False)
+        self._cached_hw: tuple[int, int] | None = None
+
+    def _get_pos_embed(self, H: int, W: int, device: torch.device, dtype: torch.dtype):
+        if self._cached_pos is not None and self._cached_hw == (H, W):
+            return self._cached_pos.to(device=device, dtype=dtype)
+        y = torch.linspace(-1.0, 1.0, steps=H, device=device, dtype=dtype)
+        x = torch.linspace(-1.0, 1.0, steps=W, device=device, dtype=dtype)
+        grid_y, grid_x = torch.meshgrid(y, x, indexing="ij")
+        coords = torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2)
+        posemb = pos2posemb2d(coords, num_pos_feats=self.hidden_dim // 2)
+        self._cached_pos = posemb.detach().cpu()
+        self._cached_hw = (H, W)
+        return posemb
+
+    def forward(self, x_t: torch.Tensor, x0: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        B, _, H, W = x_t.shape
+        device = x_t.device
+        dtype = x_t.dtype
+
+        xt_tokens = self.input_proj(x_t).flatten(2).permute(0, 2, 1)
+        x0_tokens = self.input_proj(x0).flatten(2).permute(0, 2, 1)
+
+        pos_embed = self._get_pos_embed(H, W, device, dtype).unsqueeze(0)
+        xt_tokens = xt_tokens + pos_embed + self.type_embedding.weight[0]
+        x0_tokens = x0_tokens + pos_embed + self.type_embedding.weight[1]
+
+        t_embed = self.time_proj(self.time_embed(t))[:, None, :]
+        xt_tokens = xt_tokens + t_embed
+        x0_tokens = x0_tokens + t_embed
+
+        seq = torch.cat([xt_tokens, x0_tokens], dim=1)
+        seq = self.transformer(seq)
+        seq = self.norm(seq)
+
+        xt_updated = seq[:, : H * W, :]
+        xt_updated = xt_updated.permute(0, 2, 1).reshape(B, self.hidden_dim, H, W)
+        delta = self.output_proj(xt_updated)
+        return delta
+
+
 class FlowMatchingBEV(nn.Module):
     """
     Flow Matching module that replaces diffusion-style generators.
@@ -96,13 +183,28 @@ class FlowMatchingBEV(nn.Module):
             flow_config = {}
 
         self.lpim = LPIM(**lpim_config)
-        vector_hidden = flow_config.get("hidden_channels", bev_channels)
-        time_embed_dim = flow_config.get("time_embed_dim", 64)
-        self.vector_field = FlowMatchingVectorField(
-            bev_channels=bev_channels,
-            hidden_channels=vector_hidden,
-            time_embed_dim=time_embed_dim,
-        )
+        vector_type = flow_config.get("vector_field_type", "conv")
+        if vector_type == "attention":
+            attn_hidden = flow_config.get("attention_hidden_dim", bev_channels)
+            attn_layers = flow_config.get("attention_num_layers", 4)
+            attn_heads = flow_config.get("attention_num_heads", 8)
+            attn_time_dim = flow_config.get("attention_time_embed_dim", attn_hidden)
+            self.vector_field = AttentionVectorField(
+                bev_channels=bev_channels,
+                hidden_dim=attn_hidden,
+                num_layers=attn_layers,
+                num_heads=attn_heads,
+                time_embed_dim=attn_time_dim,
+            )
+        else:
+            vector_hidden = flow_config.get("hidden_channels", bev_channels)
+            time_embed_dim = flow_config.get("time_embed_dim", 64)
+            self.vector_field = FlowMatchingVectorField(
+                bev_channels=bev_channels,
+                hidden_channels=vector_hidden,
+                time_embed_dim=time_embed_dim,
+            )
+        self.vector_field_type = vector_type
 
         self.num_inference_steps = flow_config.get("num_inference_steps", 2)
         self.noise_std = flow_config.get("noise_std", 0.0)
