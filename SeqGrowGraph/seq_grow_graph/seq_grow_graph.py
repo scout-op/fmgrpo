@@ -681,7 +681,16 @@ class SeqGrowGraph(MVXTwoStageDetector):
 
         device = pts_feats[0].device
         input_seqs = (torch.ones(pts_feats.shape[0], 1).to(device) * self.start).long()
-        outs = self.pts_bbox_head(pts_feats, input_seqs, img_metas)
+
+        # Stage III 会在训练模式下调用该函数，这里强制 head 走推理分支并避免构图
+        was_training = self.pts_bbox_head.training
+        if was_training:
+            self.pts_bbox_head.eval()
+        with torch.no_grad():
+            outs = self.pts_bbox_head(pts_feats, input_seqs, img_metas)
+        if was_training:
+            self.pts_bbox_head.train()
+
         output_seqs, values = outs
         line_results = []
         for bi in range(output_seqs.shape[0]):
